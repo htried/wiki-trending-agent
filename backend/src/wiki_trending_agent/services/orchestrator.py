@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -13,6 +14,35 @@ from wiki_trending_agent.models import AnalysisRun, PageReasoning, RunEvent, Run
 from wiki_trending_agent.services.agent_runtime import analyze_page_with_agent
 from wiki_trending_agent.services.events import record_run_event
 from wiki_trending_agent.services.trends import get_top_pages_for_hour
+
+
+def _evidence_from_result(result: dict) -> dict:
+    keys = (
+        "citations",
+        "summary",
+        "whats_new",
+        "sections_to_update",
+        "sections_skipped_not_in_article",
+        "suggested_update",
+        "wikipedia_article_url",
+    )
+    evidence = {k: result.get(k) for k in keys}
+    try:
+        json.dumps(evidence)
+    except (TypeError, ValueError):
+        evidence = {
+            "citations": result.get("citations", []) if isinstance(result.get("citations"), list) else [],
+            "summary": str(result.get("summary", "")),
+        }
+    return evidence
+
+
+def _confidence_from_result(result: dict) -> float:
+    raw = result.get("confidence", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def create_run(session: Session, hour: datetime) -> AnalysisRun:
@@ -37,13 +67,49 @@ def process_run(session: Session, run: AnalysisRun, max_pages: int | None = None
 
     serper_client = SerperClient(settings.serper_api_key) if settings.serper_api_key else None
     wikimedia_client = (
-        WikimediaStructuredContentClient(settings.wikimedia_enterprise_api_key)
-        if settings.wikimedia_enterprise_api_key
+        WikimediaStructuredContentClient(settings.wikimedia_enterprise_username, settings.wikimedia_enterprise_password)
+        if settings.wikimedia_enterprise_username and settings.wikimedia_enterprise_password
         else None
     )
 
+    try:
+        _process_run_pages(session, run, serper_client, wikimedia_client, max_pages)
+    finally:
+        if wikimedia_client is not None:
+            wikimedia_client.close()
+
+    run.status = "completed"
+    run.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.commit()
+    record_run_event(run.id, "RUN_COMPLETED", {"run_id": run.id, "status": run.status})
+    return run
+
+
+def _process_run_pages(
+    session: Session,
+    run: AnalysisRun,
+    serper_client: SerperClient | None,
+    wikimedia_client: WikimediaStructuredContentClient | None,
+    max_pages: int | None,
+) -> None:
     pages = get_top_pages_for_hour(session=session, hour=run.hour, limit=max_pages)
-    record_run_event(run.id, "PAGES_SELECTED", {"run_id": run.id, "count": len(pages)})
+    record_run_event(
+        run.id,
+        "PAGES_SELECTED",
+        {
+            "run_id": run.id,
+            "count": len(pages),
+            "pages": [
+                {
+                    "rank": i,
+                    "title": p.title,
+                    "absolute_views_current": p.absolute_views_current,
+                    "absolute_views_zscore": p.absolute_views_zscore,
+                }
+                for i, p in enumerate(pages, start=1)
+            ],
+        },
+    )
 
     for idx, page in enumerate(pages, start=1):
         session.add(
@@ -55,22 +121,30 @@ def process_run(session: Session, run: AnalysisRun, max_pages: int | None = None
                 rank=idx,
             )
         )
+        record_run_event(
+            run.id,
+            "PAGE_ANALYSIS_STARTED",
+            {"run_id": run.id, "page_title": page.title, "rank": idx},
+        )
         result = analyze_page_with_agent(
             page_title=page.title,
             hour=run.hour,
             serper_client=serper_client,
             wikimedia_client=wikimedia_client,
+            wiki_project=page.project,
             emit=lambda event_type, payload: record_run_event(
                 run.id, event_type, {"run_id": run.id, "page_title": page.title, **payload}
             ),
         )
+        conf = _confidence_from_result(result)
+        reason_text = str(result.get("summary") or result.get("reason") or "")
         session.add(
             PageReasoning(
                 run_id=run.id,
                 page_title=page.title,
-                reason=str(result.get("reason", "")),
-                confidence=float(result.get("confidence", 0.0)),
-                evidence={"citations": result.get("citations", [])},
+                reason=reason_text,
+                confidence=conf,
+                evidence=_evidence_from_result(result),
             )
         )
         record_run_event(
@@ -79,8 +153,15 @@ def process_run(session: Session, run: AnalysisRun, max_pages: int | None = None
             {
                 "run_id": run.id,
                 "page_title": page.title,
-                "reason": result.get("reason", ""),
-                "confidence": result.get("confidence", 0.0),
+                "reason": reason_text,
+                "confidence": conf,
+                "wikipedia_article_url": result.get("wikipedia_article_url"),
+                "summary": result.get("summary"),
+                "whats_new": result.get("whats_new"),
+                "sections_to_update": result.get("sections_to_update"),
+                "sections_skipped_not_in_article": result.get("sections_skipped_not_in_article"),
+                "suggested_update": result.get("suggested_update"),
+                "citations": result.get("citations"),
             },
         )
         event_candidate = str(result.get("event_candidate", "")).strip()
@@ -90,7 +171,7 @@ def process_run(session: Session, run: AnalysisRun, max_pages: int | None = None
                     run_id=run.id,
                     event_name=event_candidate[:255],
                     description=event_candidate,
-                    confidence=float(result.get("confidence", 0.0)),
+                    confidence=conf,
                 )
             )
             record_run_event(
@@ -98,12 +179,6 @@ def process_run(session: Session, run: AnalysisRun, max_pages: int | None = None
                 "EVENTS_SYNTHESIZED",
                 {"run_id": run.id, "event_name": event_candidate},
             )
-
-    run.status = "completed"
-    run.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    session.commit()
-    record_run_event(run.id, "RUN_COMPLETED", {"run_id": run.id, "status": run.status})
-    return run
 
 
 def process_run_by_id(run_id: str, max_pages: int | None = None) -> None:

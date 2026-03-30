@@ -138,6 +138,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Local SQLite DB (default DATABASE_URL)
+wiki_trending_agent.db
+
 # Environments
 .env
 .envrc

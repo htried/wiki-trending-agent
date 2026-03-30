@@ -52,5 +52,6 @@ def test_select_top_pages_for_hour() -> None:
         pages = get_top_pages_for_hour(session, hour, limit=2)
 
     assert len(pages) == 2
-    assert pages[0].title == "High_Zscore"
+    # Ordered by absolute_views_current (desc), then zscore, then title
+    assert pages[0].title == "No_Zscore_Higher_Views"
     assert pages[1].title == "Lower_Zscore"

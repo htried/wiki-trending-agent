@@ -26,8 +26,9 @@ def get_top_pages_for_hour(
         select(RawHourlyTrend)
         .where(RawHourlyTrend.dt == hour)
         .order_by(
-            desc(RawHourlyTrend.absolute_views_zscore).nulls_last(),
             desc(RawHourlyTrend.absolute_views_current),
+            desc(RawHourlyTrend.absolute_views_zscore).nulls_last(),
+            RawHourlyTrend.title,
         )
     )
     if limit is not None:

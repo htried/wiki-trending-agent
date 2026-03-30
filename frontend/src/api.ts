@@ -48,6 +48,10 @@ export function subscribeToRun(
   const eventTypes = [
     "RUN_STARTED",
     "PAGES_SELECTED",
+    "PAGE_ANALYSIS_STARTED",
+    "AGENT_TOOL_CALL",
+    "AGENT_TOOL_RESULT",
+    "AGENT_REASONING",
     "NEWS_FETCHED",
     "WIKI_FETCHED",
     "REASONING_DONE",
@@ -60,6 +64,9 @@ export function subscribeToRun(
     stream.addEventListener(eventType, (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
       onEvent({ type: eventType, payload });
+      if (eventType === "RUN_COMPLETED" || eventType === "RUN_ERROR") {
+        stream.close();
+      }
     });
   }
 
