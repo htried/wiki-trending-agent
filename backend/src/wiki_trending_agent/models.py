@@ -24,6 +24,7 @@ class RawHourlyTrend(Base):
     absolute_views_zscore: Mapped[float | None] = mapped_column(Float, nullable=True)
     views_proportion_current: Mapped[float] = mapped_column(Float)
     views_proportion_zscore: Mapped[float | None] = mapped_column(Float, nullable=True)
+    geo_distribution: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
 
 
 class AnalysisRun(Base):

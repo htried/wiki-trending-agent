@@ -13,6 +13,7 @@ from wiki_trending_agent.integrations.wikimedia_client import WikimediaStructure
 from wiki_trending_agent.models import AnalysisRun, PageReasoning, RunEvent, RunPage
 from wiki_trending_agent.services.agent_runtime import analyze_page_with_agent
 from wiki_trending_agent.services.events import record_run_event
+from wiki_trending_agent.services.geo_signals import compute_geo_signals_for_page
 from wiki_trending_agent.services.trends import get_top_pages_for_hour
 
 
@@ -137,6 +138,7 @@ def _process_run_pages(
             ),
         )
         conf = _confidence_from_result(result)
+        geo_signals = compute_geo_signals_for_page(session=session, current_page=page)
         reason_text = str(result.get("summary") or result.get("reason") or "")
         session.add(
             PageReasoning(
@@ -162,6 +164,9 @@ def _process_run_pages(
                 "sections_skipped_not_in_article": result.get("sections_skipped_not_in_article"),
                 "suggested_update": result.get("suggested_update"),
                 "citations": result.get("citations"),
+                "geo_distribution": geo_signals.get("geo_distribution", []),
+                "geo_notable_countries": geo_signals.get("geo_notable_countries", []),
+                "geo_signal_summary": geo_signals.get("geo_signal_summary", {}),
             },
         )
         event_candidate = str(result.get("event_candidate", "")).strip()

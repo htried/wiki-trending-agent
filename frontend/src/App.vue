@@ -40,6 +40,10 @@
       >
         Run analysis
       </cdx-button>
+      <span v-if="isRunInProgress" class="run-status" aria-live="polite">
+        <span class="run-status__spinner" aria-hidden="true" />
+        Analysis in progress...
+      </span>
     </div>
 
     <section
@@ -99,16 +103,6 @@
               </span>
             </summary>
             <div class="page-result__inner">
-              <p v-if="item.wikipedia_article_url" class="page-result__link-banner">
-                <!-- <a
-                  class="cdx-link"
-                  :href="item.wikipedia_article_url"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  {{ item.wikipedia_article_url }}
-                </a> -->
-              </p>
               <div
                 v-if="item.summary_html"
                 class="page-result__body"
@@ -172,6 +166,31 @@
                   </span>
                 </summary>
                 <div class="page-result__body" v-html="item.suggested_update_html" />
+              </details>
+              <details v-if="item.geo_distribution.length || item.geo_signal_summary" class="page-result__nest">
+                <summary>
+                  Geo signals
+                  <span v-if="item.geo_notable_countries.length" class="page-result__nest-hint-muted">
+                    · {{ item.geo_notable_countries.length }} notable
+                  </span>
+                  <span class="page-result__nest-hint details-hint" aria-hidden="true">
+                    <span class="details-hint__expand">Expand</span>
+                    <span class="details-hint__collapse">Collapse</span>
+                  </span>
+                </summary>
+                <p v-if="item.geo_signal_summary?.status === 'insufficient_baseline'">
+                  Insufficient historical baseline for anomaly flags.
+                </p>
+                <ul v-if="item.geo_distribution.length" class="page-result__link-list">
+                  <li v-for="country in item.geo_distribution.slice(0, 8)" :key="country.country_code">
+                    <span>{{ country.country_code }} — {{ (country.proportion * 100).toFixed(1) }}%</span>
+                    <strong
+                      v-if="item.geo_notable_countries.some((row) => row.country_code === country.country_code)"
+                    >
+                      · Notable
+                    </strong>
+                  </li>
+                </ul>
               </details>
               <section
                 v-if="item.citations.length"
@@ -245,6 +264,15 @@ const TIMELINE_SCROLL_AFTER = 5;
 type Citation = { title: string; url: string; reliability_note?: string };
 type SectionToUpdate = { section_heading: string; section_url: string };
 type SectionSkipped = { section_heading: string; section_url: string; reason?: string };
+type GeoDistributionRow = { country_code: string; proportion: number };
+type GeoNotableCountry = {
+  country_code: string;
+  current_share: number;
+  baseline_mean: number;
+  zscore: number;
+  sample_count: number;
+};
+type GeoSignalSummary = { status: string; notable_count: number; strongest_country_code?: string | null };
 
 type PageResult = {
   title: string;
@@ -257,6 +285,9 @@ type PageResult = {
   sections_skipped: SectionSkipped[];
   citations: Citation[];
   confidence?: number;
+  geo_distribution: GeoDistributionRow[];
+  geo_notable_countries: GeoNotableCountry[];
+  geo_signal_summary?: GeoSignalSummary;
 };
 
 type TimelineEntry = { id: string; line: string; sub?: string };
@@ -330,6 +361,49 @@ function parseSectionsSkipped(raw: unknown): SectionSkipped[] {
     .filter((s) => s.section_heading.length > 0 || s.section_url.length > 0);
 }
 
+function parseGeoDistribution(raw: unknown): GeoDistributionRow[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((row): row is Record<string, unknown> => row !== null && typeof row === "object")
+    .map((row) => ({
+      country_code: String(row.country_code ?? ""),
+      proportion: Number(row.proportion ?? 0),
+    }))
+    .filter((row) => row.country_code.length > 0 && Number.isFinite(row.proportion))
+    .sort((a, b) => b.proportion - a.proportion);
+}
+
+function parseGeoNotableCountries(raw: unknown): GeoNotableCountry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((row): row is Record<string, unknown> => row !== null && typeof row === "object")
+    .map((row) => ({
+      country_code: String(row.country_code ?? ""),
+      current_share: Number(row.current_share ?? 0),
+      baseline_mean: Number(row.baseline_mean ?? 0),
+      zscore: Number(row.zscore ?? 0),
+      sample_count: Number(row.sample_count ?? 0),
+    }))
+    .filter((row) => row.country_code.length > 0)
+    .sort((a, b) => b.zscore - a.zscore);
+}
+
+function parseGeoSignalSummary(raw: unknown): GeoSignalSummary | undefined {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  return {
+    status: String(obj.status ?? "ok"),
+    notable_count: Number(obj.notable_count ?? 0),
+    strongest_country_code: obj.strongest_country_code ? String(obj.strongest_country_code) : null,
+  };
+}
+
 const hours = ref<string[]>([]);
 const selectedHour = ref<string | number | null>(null);
 const topKPages = ref<string | number>("");
@@ -339,6 +413,7 @@ let timelineCounter = 0;
 const pageResults = ref<PageResult[]>([]);
 const eventCandidates = ref<string[]>([]);
 const activeStream = ref<EventSource | null>(null);
+const isRunInProgress = ref(false);
 
 const hourMenuItems = computed(() => hours.value.map((h) => ({ value: h, label: h })));
 
@@ -359,6 +434,7 @@ const handleRunEvent = (event: RunEvent): void => {
 
   switch (type) {
     case "RUN_STARTED":
+      isRunInProgress.value = true;
       appendTimeline("Run started");
       break;
     case "PAGES_SELECTED": {
@@ -472,6 +548,9 @@ const handleRunEvent = (event: RunEvent): void => {
           sections_skipped: parseSectionsSkipped(payload.sections_skipped_not_in_article),
           citations: normalizeCitations(payload.citations),
           confidence: typeof payload.confidence === "number" ? payload.confidence : undefined,
+          geo_distribution: parseGeoDistribution(payload.geo_distribution),
+          geo_notable_countries: parseGeoNotableCountries(payload.geo_notable_countries),
+          geo_signal_summary: parseGeoSignalSummary(payload.geo_signal_summary),
         },
       ];
       break;
@@ -483,10 +562,12 @@ const handleRunEvent = (event: RunEvent): void => {
       break;
     }
     case "RUN_COMPLETED":
+      isRunInProgress.value = false;
       appendTimeline("Run completed");
       error.value = "";
       break;
     case "RUN_ERROR": {
+      isRunInProgress.value = false;
       const detail = String(payload.error ?? "").trim();
       appendTimeline(detail ? `Run error: ${detail}` : "Run error");
       error.value = detail || "Run failed";
@@ -514,6 +595,7 @@ onUnmounted(() => {
 
 const handleRun = async (): Promise<void> => {
   error.value = "";
+  isRunInProgress.value = true;
   timeline.value = [];
   timelineCounter = 0;
   pageResults.value = [];
@@ -530,7 +612,33 @@ const handleRun = async (): Promise<void> => {
     const run = await startRun(hour, topK);
     activeStream.value = subscribeToRun(run.run_id, handleRunEvent);
   } catch (err) {
+    isRunInProgress.value = false;
     error.value = err instanceof Error ? err.message : "Failed to run analysis";
   }
 };
 </script>
+
+<style scoped>
+.run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #54595d;
+  font-size: 0.9rem;
+}
+
+.run-status__spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid #c8ccd1;
+  border-top-color: #36c;
+  border-radius: 50%;
+  animation: run-spin 0.8s linear infinite;
+}
+
+@keyframes run-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+</style>
